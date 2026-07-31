@@ -31,6 +31,20 @@ pub async fn import_pkcs11_token(
     result
 }
 
+/// Reconstruct a DER-encoded SubjectPublicKeyInfo for an RSA public key from its raw
+/// modulus and public exponent (CKA_MODULUS / CKA_PUBLIC_EXPONENT).
+///
+/// This exists as a fallback for HSMs that don't populate CKA_PUBLIC_KEY_INFO (observed
+/// on Utimaco CryptoServer, which returns it as an empty/absent attribute rather than the
+/// SubjectPublicKeyInfo DER most PKCS#11 consumers expect).
+fn rsa_spki_from_components(modulus: Option<&[u8]>, exponent: Option<&[u8]>) -> Option<Vec<u8>> {
+    let n = openssl::bn::BigNum::from_slice(modulus?).ok()?;
+    let e = openssl::bn::BigNum::from_slice(exponent?).ok()?;
+    let rsa = openssl::rsa::Rsa::from_public_components(n, e).ok()?;
+    let pkey = openssl::pkey::PKey::from_rsa(rsa).ok()?;
+    pkey.public_key_to_der().ok()
+}
+
 async fn import_pkcs11_token_private(
     pkcs11: &Pkcs11,
     conn: &mut SqliteConnection,
@@ -149,7 +163,18 @@ async fn import_pkcs11_token_private(
         }
     }
 
-    let public_key_attributes = [AttributeType::Id, AttributeType::PublicKeyInfo];
+    // Some HSMs (observed on Utimaco CryptoServer) don't populate CKA_PUBLIC_KEY_INFO at all,
+    // returning it as an empty/absent attribute rather than the SubjectPublicKeyInfo DER the
+    // rest of this function expects. As a fallback for RSA keys, also request the raw modulus
+    // and public exponent so we can reconstruct the SPKI DER ourselves when the vendor attribute
+    // is missing. (EC keys on such HSMs would need a similar fallback using CKA_EC_POINT/
+    // CKA_EC_PARAMS; not implemented here since this deployment only uses RSA keys.)
+    let public_key_attributes = [
+        AttributeType::Id,
+        AttributeType::PublicKeyInfo,
+        AttributeType::Modulus,
+        AttributeType::PublicExponent,
+    ];
     for object in session
         .iter_objects(&[Attribute::Class(ObjectClass::PUBLIC_KEY)])
         .context("Failed to search public key objects")?
@@ -161,16 +186,25 @@ async fn import_pkcs11_token_private(
 
         let mut key_id = None;
         let mut public_key_info = None;
+        let mut modulus = None;
+        let mut public_exponent = None;
 
         for attr in attributes {
             match attr {
                 Attribute::Id(id) => key_id = Some(id),
-                Attribute::PublicKeyInfo(der) => public_key_info = Some(der),
+                Attribute::PublicKeyInfo(der) if !der.is_empty() => public_key_info = Some(der),
+                Attribute::Modulus(m) if !m.is_empty() => modulus = Some(m),
+                Attribute::PublicExponent(e) if !e.is_empty() => public_exponent = Some(e),
                 _ => {}
             }
         }
 
-        if let (Some(id), Some(der)) = (key_id, public_key_info)
+        // Prefer the vendor-provided SPKI DER; fall back to constructing it ourselves from
+        // the raw RSA key material if the HSM didn't populate CKA_PUBLIC_KEY_INFO.
+        let der = public_key_info
+            .or_else(|| rsa_spki_from_components(modulus.as_deref(), public_exponent.as_deref()));
+
+        if let (Some(id), Some(der)) = (key_id, der)
             && let Some(entry) = token_keys.get_mut(&id)
         {
             entry.public_key_der = Some(der);
