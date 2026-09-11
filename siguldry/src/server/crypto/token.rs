@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use cryptoki::{
     context::{CInitializeArgs, CInitializeFlags, Pkcs11},
-    object::{Attribute, AttributeType, ObjectClass},
+    object::{Attribute, AttributeType, KeyType, ObjectClass},
     types::AuthPin,
 };
 use openssl::{nid::Nid, x509};
@@ -29,6 +29,29 @@ pub async fn import_pkcs11_token(
     let result = import_pkcs11_token_private(&pkcs11, conn, module, slot, token_user_pin).await;
     pkcs11.finalize()?;
     result
+}
+
+fn pkey_attributes_to_spki_rsa(attributes: &Vec<Attribute>) -> anyhow::Result<Vec<u8>> {
+    let mut modulus = None;
+    let mut public_exponent = None;
+
+    for attr in attributes {
+        match attr {
+            Attribute::Modulus(m) if !m.is_empty() => modulus = Some(m),
+            Attribute::PublicExponent(e) if !e.is_empty() => public_exponent = Some(e),
+            _ => {}
+        }
+    }
+
+    let n = openssl::bn::BigNum::from_slice(
+        modulus.ok_or_else(|| anyhow::anyhow!("missing CKA_MODULUS"))?,
+    )?;
+    let e = openssl::bn::BigNum::from_slice(
+        public_exponent.ok_or_else(|| anyhow::anyhow!("missing CKA_PUBLIC_EXPONENT"))?,
+    )?;
+    let key = openssl::rsa::Rsa::from_public_components(n, e)?;
+    let pkey = openssl::pkey::PKey::from_rsa(key)?.public_key_to_der()?;
+    Ok(pkey)
 }
 
 async fn import_pkcs11_token_private(
@@ -149,7 +172,18 @@ async fn import_pkcs11_token_private(
         }
     }
 
-    let public_key_attributes = [AttributeType::Id, AttributeType::PublicKeyInfo];
+    // Some HSMs (observed on Utimaco CryptoServer) don't populate CKA_PUBLIC_KEY_INFO at all,
+    // returning it as an empty/absent attribute rather than the SubjectPublicKeyInfo DER the
+    // rest of this function expects. As a fallback for RSA keys, also request the raw modulus
+    // and public exponent so we can reconstruct the SPKI DER ourselves when the vendor attribute
+    // is missing.
+    let public_key_attributes = [
+        AttributeType::Id,
+        AttributeType::PublicKeyInfo,
+        AttributeType::KeyType,
+        AttributeType::Modulus,
+        AttributeType::PublicExponent,
+    ];
     for object in session
         .iter_objects(&[Attribute::Class(ObjectClass::PUBLIC_KEY)])
         .context("Failed to search public key objects")?
@@ -161,14 +195,25 @@ async fn import_pkcs11_token_private(
 
         let mut key_id = None;
         let mut public_key_info = None;
+        let mut key_type = None;
 
-        for attr in attributes {
+        for attr in &attributes {
             match attr {
-                Attribute::Id(id) => key_id = Some(id),
-                Attribute::PublicKeyInfo(der) => public_key_info = Some(der),
+                Attribute::Id(id) => key_id = Some(id.clone()),
+                Attribute::PublicKeyInfo(der) if !der.is_empty() => {
+                    public_key_info = Some(der.clone());
+                }
+                Attribute::KeyType(kt) => key_type = Some(*kt),
                 _ => {}
             }
         }
+
+        // Prefer the vendor-provided SPKI DER; fall back to constructing it ourselves from
+        // the raw key material if the HSM didn't populate CKA_PUBLIC_KEY_INFO.
+        public_key_info = public_key_info.or_else(|| match key_type {
+            Some(KeyType::RSA) => pkey_attributes_to_spki_rsa(&attributes).ok(),
+            _ => None,
+        });
 
         if let (Some(id), Some(der)) = (key_id, public_key_info)
             && let Some(entry) = token_keys.get_mut(&id)
